@@ -50,6 +50,11 @@ type StackResource struct {
 	Timestamp          time.Time
 	StackID            string
 	StackName          string
+	// Materialization (route66 fork) records whether the resource really
+	// exists in a kumo service store ("MATERIALIZED") or is deliberately
+	// status-tracked only ("TRACKED_INERT"). Never empty for stacks created
+	// after the materializer landed — silence was the facade bug.
+	Materialization string
 }
 
 // TemplateValidationResult represents the result of template validation.
@@ -252,6 +257,11 @@ type XMLStackResource struct {
 	PhysicalResourceID string `xml:"PhysicalResourceId"`
 	ResourceType       string `xml:"ResourceType"`
 	ResourceStatus     string `xml:"ResourceStatus"`
+	// ResourceStatusReason carries the route66-fork Materialization marker
+	// ("MATERIALIZED" / "TRACKED_INERT") so clients can see which resources
+	// really exist in the emulator stores. Real CFN uses this field for
+	// free-text status detail, so SDKs surface it without changes.
+	ResourceStatusReason string `xml:"ResourceStatusReason,omitempty"`
 	Timestamp          string `xml:"Timestamp"`
 	StackID            string `xml:"StackId"`
 	StackName          string `xml:"StackName"`

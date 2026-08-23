@@ -105,3 +105,10 @@ func (s *Service) Meta() service.Meta {
 		Description: "Systems Manager",
 	}
 }
+
+// StorageBackend exposes the service's storage for in-process cross-service
+// integration (route66 fork: CloudFormation resource materialization / SES
+// store unification). Not part of upstream kumo.
+func (s *Service) StorageBackend() Storage {
+	return s.storage
+}

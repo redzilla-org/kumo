@@ -75,3 +75,11 @@ func (r *Registry) Names() []string {
 
 	return names
 }
+
+// Get returns a service from the global registry by name.
+// Added by the route66 fork so cross-service features (CloudFormation
+// materialization, SESv2->SESv1 store mirroring) can reach a sibling
+// service's singleton without going over HTTP.
+func Get(name string) (Service, bool) {
+	return globalRegistry.Get(name)
+}

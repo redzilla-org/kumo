@@ -41,6 +41,17 @@ func (s *Service) CreateStack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// route66 fork: actually materialize the template's resources into the
+	// sibling service stores. A failure rolls the stack record back and
+	// fails the API call loudly — never a green stack over missing resources.
+	if err := materializeStack(r.Context(), &req, stack, resolveRegion(r)); err != nil {
+		_ = s.storage.DeleteStack(r.Context(), req.StackName)
+
+		writeCFNError(w, errInvalidParameter, "materialization failed: "+err.Error(), http.StatusBadRequest)
+
+		return
+	}
+
 	writeCFNXMLResponse(w, XMLCreateStackResponse{
 		Xmlns: cfnXMLNS,
 		Result: XMLCreateStackResult{
@@ -61,6 +72,22 @@ func (s *Service) DeleteStack(w http.ResponseWriter, r *http.Request) {
 
 	if req.StackName == "" {
 		writeCFNError(w, errInvalidParameter, "StackName is required", http.StatusBadRequest)
+
+		return
+	}
+
+	// route66 fork: tear down materialized resources before dropping the
+	// stack record. Resources are fetched first because DeleteStack removes
+	// the record. Teardown failure fails the API call — no silent leaks.
+	resources, resErr := s.storage.DescribeStackResources(r.Context(), req.StackName, "")
+	if resErr != nil {
+		handleCFNError(w, resErr)
+
+		return
+	}
+
+	if err := teardownStack(r.Context(), resources); err != nil {
+		writeCFNError(w, errInternalError, "teardown failed: "+err.Error(), http.StatusInternalServerError)
 
 		return
 	}
@@ -375,7 +402,8 @@ func convertToXMLStackResource(resource *StackResource) XMLStackResource {
 		LogicalResourceID:  resource.LogicalResourceID,
 		PhysicalResourceID: resource.PhysicalResourceID,
 		ResourceType:       resource.ResourceType,
-		ResourceStatus:     resource.ResourceStatus,
+		ResourceStatus:       resource.ResourceStatus,
+		ResourceStatusReason: resource.Materialization,
 		Timestamp:          resource.Timestamp.Format("2006-01-02T15:04:05.000Z"),
 		StackID:            resource.StackID,
 		StackName:          resource.StackName,
