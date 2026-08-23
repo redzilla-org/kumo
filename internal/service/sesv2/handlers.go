@@ -1,12 +1,14 @@
 package sesv2
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/sivchari/kumo/internal/service"
+	"github.com/sivchari/kumo/internal/service/ses"
 )
 
 // CreateEmailIdentity handles the CreateEmailIdentity operation.
@@ -467,9 +469,56 @@ func (s *Service) SendEmail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// route66 fork: mirror the v2 send into the v1 SES store so the single
+	// mailbox oracle endpoint (GET /_aws/ses) sees mail from both APIs.
+	s.mirrorToV1Store(r.Context(), messageID, &req)
+
 	writeJSONResponse(w, SendEmailResponse{
 		MessageID: messageID,
 	})
+}
+
+// mirrorToV1Store records a v2 SendEmail in the v1 SES message store, keyed
+// by the same MessageId, so /_aws/ses is the one store of truth for sent mail.
+func (s *Service) mirrorToV1Store(ctx context.Context, messageID string, req *SendEmailRequest) {
+	svc, ok := service.Get("ses")
+	if !ok {
+		return
+	}
+
+	v1, ok := svc.(*ses.Service)
+	if !ok {
+		return
+	}
+
+	email := &ses.SentEmail{
+		MessageID: messageID,
+		Source:    req.FromEmailAddress,
+	}
+
+	if req.Destination != nil {
+		email.Destination = append(email.Destination, req.Destination.ToAddresses...)
+		email.Destination = append(email.Destination, req.Destination.CcAddresses...)
+		email.Destination = append(email.Destination, req.Destination.BccAddresses...)
+	}
+
+	if req.Content != nil && req.Content.Simple != nil {
+		if req.Content.Simple.Subject != nil {
+			email.Subject = req.Content.Simple.Subject.Data
+		}
+
+		if req.Content.Simple.Body != nil {
+			if req.Content.Simple.Body.Text != nil {
+				email.Body = req.Content.Simple.Body.Text.Data
+			}
+
+			if req.Content.Simple.Body.HTML != nil {
+				email.HTMLBody = req.Content.Simple.Body.HTML.Data
+			}
+		}
+	}
+
+	v1.RecordEmail(ctx, email)
 }
 
 // GetSentEmails handles the GetSentEmails operation.

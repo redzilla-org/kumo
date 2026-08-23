@@ -61,6 +61,10 @@ func (s *Service) RegisterRoutes(r service.Router) {
 
 	// Send Email routes.
 	r.HandleFunc("POST", "/ses/v2/email/outbound-emails", s.SendEmail)
+	// route66 fork: aws-sdk-go-v2/service/sesv2 and boto3 both POST to
+	// /v2/email/outbound-emails (no /ses prefix) — without this alias the
+	// real SDK path 404s while only the kumo-internal path works.
+	r.HandleFunc("POST", "/v2/email/outbound-emails", s.SendEmail)
 	r.HandleFunc("POST", "/ses/v2/email/outbound-bulk-emails", s.SendBulkEmail)
 
 	// kumo-specific endpoint for testing.

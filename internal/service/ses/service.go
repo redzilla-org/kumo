@@ -1,6 +1,7 @@
 package ses
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -87,5 +88,27 @@ func (s *Service) Meta() service.Meta {
 		Display:     "SES",
 		Category:    "Application Integration",
 		Description: "Email service",
+	}
+}
+
+// StorageBackend exposes the service's storage for in-process cross-service
+// integration (route66 fork: CloudFormation resource materialization / SES
+// store unification). Not part of upstream kumo.
+func (s *Service) StorageBackend() Storage {
+	return s.storage
+}
+
+// RecordEmail stores an already-sent email in the message store, preserving
+// the caller-assigned MessageID. Used by the SESv2 service (route66 fork) to
+// mirror v2 sends into the single v1 mailbox store.
+func (s *Service) RecordEmail(ctx context.Context, email *SentEmail) {
+	id := email.MessageID
+	// storage.SendEmail assigns a fresh MessageID to the stored record; the
+	// record is the same pointer, so restore the v2-assigned id afterwards
+	// to keep the two APIs' MessageIds consistent.
+	_, _ = s.storage.SendEmail(ctx, email)
+
+	if id != "" {
+		email.MessageID = id
 	}
 }

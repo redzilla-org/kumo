@@ -205,8 +205,20 @@ func (m *MemoryStorage) GetMailbox(_ context.Context, email string) ([]*SentEmai
 	var result []*SentEmail
 
 	for _, e := range m.Emails {
+		// route66 fork: match by recipient as well as sender — test oracles
+		// correlate captured mail on the destination address.
 		if e.Source == email {
 			result = append(result, e)
+
+			continue
+		}
+
+		for _, d := range e.Destination {
+			if d == email {
+				result = append(result, e)
+
+				break
+			}
 		}
 	}
 
