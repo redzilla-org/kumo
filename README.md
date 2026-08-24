@@ -8,6 +8,34 @@
   <a href="https://github.com/sivchari/kumo/actions/workflows/integration-test.yaml"><img src="https://github.com/sivchari/kumo/actions/workflows/integration-test.yaml/badge.svg" alt="Integration Tests"></a>
 </p>
 
+> ## About this fork
+>
+> This is [redzilla-org/kumo](https://github.com/redzilla-org/kumo), a fork of
+> [sivchari/kumo](https://github.com/sivchari/kumo) maintained for the Route 66
+> platform, where it is the local AWS emulator the `local-verify` battery runs
+> both markets against. It tracks upstream and carries two additions:
+>
+> **CloudFormation resources are actually materialized.** Upstream accepts a
+> template and reports the stack green without creating anything, so a stack is
+> a record, not an effect. Here `CreateStack` walks `Resources` in dependency
+> order, evaluates `Ref` / `Fn::Sub` (including pseudo-parameters), and creates
+> the real objects in-process through the service registry — DynamoDB tables
+> with their GSIs and TTL, S3 buckets, SSM parameters. IAM/Glue/Athena resources
+> are status-tracked and marked `TRACKED_INERT` in `ResourceStatusReason`, and
+> **any other unsupported type fails the stack loudly** rather than presenting
+> the silently-green facade. `DeleteStack` tears down what it materialized.
+> This is what lets a committed CloudFormation template be the single
+> deployable definition of local test infrastructure.
+>
+> **SESv2 sends land in the same mailbox as v1.** The fork registers
+> `POST /v2/email/outbound-emails` — the path `aws-sdk-go-v2` and boto3
+> actually use — and mirrors v2 sends into the v1 message store under the same
+> `MessageId`, so `GET /_aws/ses` is one mailbox oracle for both APIs regardless
+> of which SDK the code under test happens to use. `/_aws/ses` also matches on
+> recipient (To/Cc/Bcc), not sender alone.
+>
+> Everything below is upstream's documentation and applies unchanged.
+
 <p align="center">A lightweight AWS service emulator written in Go.<br>Works as both a CI/CD testing tool and a local development server with optional data persistence.</p>
 
 ## Features
