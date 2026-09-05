@@ -13,7 +13,7 @@
 > This is [redzilla-org/kumo](https://github.com/redzilla-org/kumo), a fork of
 > [sivchari/kumo](https://github.com/sivchari/kumo) maintained for the Route 66
 > platform, where it is the local AWS emulator the `local-verify` battery runs
-> both markets against. It tracks upstream and carries two additions:
+> both markets against. It tracks upstream and carries three additions:
 >
 > **CloudFormation resources are actually materialized.** Upstream accepts a
 > template and reports the stack green without creating anything, so a stack is
@@ -33,6 +33,20 @@
 > `MessageId`, so `GET /_aws/ses` is one mailbox oracle for both APIs regardless
 > of which SDK the code under test happens to use. `/_aws/ses` also matches on
 > recipient (To/Cc/Bcc), not sender alone.
+>
+> **DynamoDB UpdateExpression supports document paths.** Upstream substituted
+> `ExpressionAttributeNames` into the raw expression and then treated the whole
+> path as one flat attribute name, so `SET #attrs.#n0 = :v0` created a
+> top-level attribute literally called `attributes.attr_a` and left the
+> `attributes` map empty (and `REMOVE #attrs.#n0` removed nothing) — the shape
+> the webapp's session store writes every session attribute with. Paths are now
+> tokenized before aliases are resolved (a name may itself contain a `.`, which
+> is why it is aliased) and every action — SET, ADD, DELETE, REMOVE — plus the
+> condition evaluator resolve through one `get`/`set`/`remove` walk over the
+> attribute-value tree, including `[N]` list indexes. Missing intermediate
+> elements are not auto-created: the request fails with DynamoDB's
+> `ValidationException`, "The document path provided in the update expression is
+> invalid for update". route66 GH #3669.
 >
 > Everything below is upstream's documentation and applies unchanged.
 

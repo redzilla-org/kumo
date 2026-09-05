@@ -1324,28 +1324,45 @@ func (m *MemoryStorage) attributeValuesEqual(a, b AttributeValue) bool {
 
 // applyUpdateExpression applies an update expression to an item.
 // Supports SET, ADD, DELETE, and REMOVE clauses.
-func (m *MemoryStorage) applyUpdateExpression(item Item, updateExpr string, exprNames map[string]string, exprValues map[string]AttributeValue) Item {
-	expr := updateExpr
-	for placeholder, name := range exprNames {
-		expr = strings.ReplaceAll(expr, placeholder, name)
+//
+// route66 fork (GH #3669, local-verify run 140): expression attribute names are
+// no longer substituted into the raw expression before parsing. Substituting
+// first and splitting paths on '.' second is what made "SET #attrs.#n0 = :v0"
+// write a flat top-level attribute named "attributes.attr_a"; every path is now
+// tokenized while aliases are still opaque and resolved element by element (see
+// document_path.go). Clause splitting is unaffected: SET/ADD/DELETE/REMOVE
+// appear literally in the raw expression, and not substituting also stops a
+// resolved name from forging a keyword.
+//
+// Every action reads its operands from pre, a snapshot taken before any action
+// runs, because DynamoDB evaluates all actions of one expression against the
+// pre-update item.
+func (m *MemoryStorage) applyUpdateExpression(item Item, updateExpr string, exprNames map[string]string, exprValues map[string]AttributeValue) (Item, error) {
+	pre := m.copyItem(item)
+	if pre == nil {
+		pre = Item{}
 	}
 
-	clauses := parseUpdateClauses(expr)
+	for _, clause := range parseUpdateClauses(updateExpr) {
+		var err error
 
-	for _, clause := range clauses {
 		switch clause.action {
 		case updateActionSet:
-			item = applySetClause(item, clause.body, exprValues)
+			err = applySetClause(item, pre, clause.body, exprNames, exprValues)
 		case updateActionAdd:
-			item = applyAddClause(item, clause.body, exprValues)
+			err = applyAddClause(item, pre, clause.body, exprNames, exprValues)
 		case updateActionDel:
-			item = applyDeleteClause(item, clause.body, exprValues)
+			err = applyDeleteClause(item, pre, clause.body, exprNames, exprValues)
 		case updateActionRem:
-			item = applyRemoveClause(item, clause.body)
+			err = applyRemoveClause(item, clause.body, exprNames)
+		}
+
+		if err != nil {
+			return nil, err
 		}
 	}
 
-	return item
+	return item, nil
 }
 
 func (m *MemoryStorage) applyValidatedUpdateExpression(table *Table, item Item, updateExpr string, exprNames map[string]string, exprValues map[string]AttributeValue) (Item, error) {
@@ -1353,7 +1370,7 @@ func (m *MemoryStorage) applyValidatedUpdateExpression(table *Table, item Item, 
 		return nil, err
 	}
 
-	return m.applyUpdateExpression(item, updateExpr, exprNames, exprValues), nil
+	return m.applyUpdateExpression(item, updateExpr, exprNames, exprValues)
 }
 
 func validateUpdateExpressionDoesNotTouchKeys(updateExpr string, exprNames map[string]string, keySchema []KeySchemaElement) error {
@@ -1366,14 +1383,24 @@ func validateUpdateExpressionDoesNotTouchKeys(updateExpr string, exprNames map[s
 		return nil
 	}
 
-	expr := resolveNames(updateExpr, exprNames)
-	for _, clause := range parseUpdateClauses(expr) {
-		for _, path := range updatedAttributePaths(clause) {
-			attrName := topLevelAttribute(path)
-			if _, ok := keyNames[attrName]; ok {
+	// route66 fork (GH #3669): the key check runs through the shared
+	// document-path parser instead of substituting names and cutting at the
+	// first '.'. That keeps an alias whose value contains a '.' as ONE element
+	// (so it is compared whole against the key names), and reduces a nested
+	// write such as "SET #attrs.#n0 = :v" to its root attribute. A path that
+	// does not parse is left alone here: the apply step rejects it with the
+	// invalid-document-path ValidationException.
+	for _, clause := range parseUpdateClauses(updateExpr) {
+		for _, rawPath := range updatedAttributePaths(clause) {
+			path, err := parseDocumentPath(rawPath, exprNames)
+			if err != nil {
+				continue
+			}
+
+			if _, ok := keyNames[path[0].name]; ok {
 				return &TableError{
 					Code:    "ValidationException",
-					Message: "One or more parameter values were invalid: Cannot update key attribute " + attrName,
+					Message: "One or more parameter values were invalid: Cannot update key attribute " + path[0].name,
 				}
 			}
 		}
@@ -1413,15 +1440,6 @@ func updatedAttributePaths(clause updateClause) []string {
 	default:
 		return nil
 	}
-}
-
-func topLevelAttribute(path string) string {
-	path = strings.TrimSpace(path)
-	if idx := strings.IndexAny(path, ".["); idx >= 0 {
-		return strings.TrimSpace(path[:idx])
-	}
-
-	return path
 }
 
 type updateClause struct {
@@ -1495,38 +1513,67 @@ func asciiUpper(s string) string {
 	return string(out)
 }
 
-// applySetClause handles SET attr = :val, SET attr = if_not_exists(attr, :val).
-func applySetClause(item Item, clause string, exprValues map[string]AttributeValue) Item {
-	assignments := splitAssignments(clause)
-	for _, assignment := range assignments {
+// applySetClause handles SET path = :val, SET path = other_path,
+// SET path = path +/- :val and SET path = if_not_exists(path, :val).
+//
+// route66 fork (GH #3669): the assignment target is a document path resolved
+// through document_path.go instead of a flat map key, so "SET #attrs.#n0 = :v0"
+// writes INSIDE the "attributes" map. Right-hand operands read from pre, the
+// pre-update snapshot.
+func applySetClause(item, pre Item, clause string, exprNames map[string]string, exprValues map[string]AttributeValue) error {
+	for _, assignment := range splitAssignments(clause) {
 		parts := strings.SplitN(strings.TrimSpace(assignment), "=", 2)
 		if len(parts) != 2 {
 			continue
 		}
 
-		attrName := strings.TrimSpace(parts[0])
-		valueExpr := strings.TrimSpace(parts[1])
+		path, err := parseDocumentPath(parts[0], exprNames)
+		if err != nil {
+			return err
+		}
 
-		// Handle if_not_exists(attr, :val) — but only if not combined with arithmetic.
-		if strings.HasPrefix(valueExpr, "if_not_exists(") && !containsArithmeticOp(valueExpr) {
-			applyIfNotExists(item, attrName, valueExpr, exprValues)
-
+		val, ok := resolveSetValue(pre, strings.TrimSpace(parts[1]), exprNames, exprValues)
+		if !ok {
 			continue
 		}
 
-		// Handle arithmetic: path + :val, path - :val, if_not_exists(...) + :val
-		if val, ok := evaluateSetArithmetic(item, valueExpr, exprValues); ok {
-			item[attrName] = val
-
-			continue
-		}
-
-		if val, ok := exprValues[valueExpr]; ok {
-			item[attrName] = val
+		if err := setDocumentPath(item, path, val); err != nil {
+			return err
 		}
 	}
 
-	return item
+	return nil
+}
+
+// resolveSetValue evaluates the right-hand side of a SET assignment against the
+// pre-update item. The boolean is false when the expression names nothing
+// resolvable, which preserves the long-standing behavior of skipping such an
+// assignment rather than writing a zero value.
+func resolveSetValue(pre Item, valueExpr string, exprNames map[string]string, exprValues map[string]AttributeValue) (AttributeValue, bool) {
+	// if_not_exists(path, :val) — but only if not combined with arithmetic,
+	// where it is instead one of the arithmetic operands.
+	if strings.HasPrefix(valueExpr, "if_not_exists(") && !containsArithmeticOp(valueExpr) {
+		return resolveIfNotExists(pre, valueExpr, exprNames, exprValues)
+	}
+
+	// Arithmetic: path + :val, path - :val, if_not_exists(...) + :val.
+	if val, ok := evaluateSetArithmetic(pre, valueExpr, exprNames, exprValues); ok {
+		return val, true
+	}
+
+	if val, ok := exprValues[valueExpr]; ok {
+		return val, true
+	}
+
+	// route66 fork (GH #3669): SET path = other_path copies the other path's
+	// pre-update value. A right-hand side that is not a parseable path leaves
+	// the target untouched, as before.
+	path, err := parseDocumentPath(valueExpr, exprNames)
+	if err != nil {
+		return AttributeValue{}, false
+	}
+
+	return getDocumentPath(pre, path)
 }
 
 // splitAssignments splits a SET clause into individual assignments, respecting parentheses.
@@ -1576,7 +1623,7 @@ func containsArithmeticOp(expr string) bool {
 }
 
 // evaluateSetArithmetic handles "path + :val" and "path - :val" expressions.
-func evaluateSetArithmetic(item Item, expr string, exprValues map[string]AttributeValue) (AttributeValue, bool) {
+func evaluateSetArithmetic(pre Item, expr string, exprNames map[string]string, exprValues map[string]AttributeValue) (AttributeValue, bool) {
 	for _, op := range []string{" + ", " - "} {
 		idx := strings.Index(expr, op)
 		if idx == -1 {
@@ -1586,8 +1633,8 @@ func evaluateSetArithmetic(item Item, expr string, exprValues map[string]Attribu
 		leftToken := strings.TrimSpace(expr[:idx])
 		rightToken := strings.TrimSpace(expr[idx+len(op):])
 
-		left := resolveSetOperand(item, leftToken, exprValues)
-		right := resolveSetOperand(item, rightToken, exprValues)
+		left := resolveSetOperand(pre, leftToken, exprNames, exprValues)
+		right := resolveSetOperand(pre, rightToken, exprNames, exprValues)
 
 		if left.N == nil || right.N == nil {
 			return AttributeValue{}, false
@@ -1616,10 +1663,17 @@ func evaluateSetArithmetic(item Item, expr string, exprValues map[string]Attribu
 }
 
 // resolveSetOperand resolves a token to an AttributeValue for SET expressions.
-// Supports: :placeholder, path, and if_not_exists(path, :default).
-func resolveSetOperand(item Item, token string, exprValues map[string]AttributeValue) AttributeValue {
+// Supports: :placeholder, document path, and if_not_exists(path, :default).
+//
+// route66 fork (GH #3669): a path operand goes through the shared resolver, so
+// "SET #c = #c + :inc" still works now that aliases are no longer substituted
+// into the raw expression, and a nested operand ("#attrs.#n0 + :inc") reads the
+// nested value instead of a non-existent flat attribute.
+func resolveSetOperand(pre Item, token string, exprNames map[string]string, exprValues map[string]AttributeValue) AttributeValue {
 	if strings.HasPrefix(token, "if_not_exists(") {
-		return resolveIfNotExists(item, token, exprValues)
+		val, _ := resolveIfNotExists(pre, token, exprNames, exprValues)
+
+		return val
 	}
 
 	if strings.HasPrefix(token, ":") {
@@ -1630,83 +1684,75 @@ func resolveSetOperand(item Item, token string, exprValues map[string]AttributeV
 		return AttributeValue{}
 	}
 
-	if val, ok := item[token]; ok {
-		return val
+	path, err := parseDocumentPath(token, exprNames)
+	if err != nil {
+		return AttributeValue{}
 	}
 
-	return AttributeValue{}
+	val, _ := getDocumentPath(pre, path)
+
+	return val
 }
 
-// resolveIfNotExists evaluates if_not_exists(path, :default) and returns the resolved value.
-func resolveIfNotExists(item Item, token string, exprValues map[string]AttributeValue) AttributeValue {
+// resolveIfNotExists evaluates if_not_exists(path, :default) against the
+// pre-update item, returning the existing value when the path resolves and the
+// default otherwise. The boolean is false when neither resolves, in which case
+// the caller leaves the target attribute untouched.
+func resolveIfNotExists(pre Item, token string, exprNames map[string]string, exprValues map[string]AttributeValue) (AttributeValue, bool) {
 	inner := strings.TrimPrefix(token, "if_not_exists(")
 	inner = strings.TrimSuffix(inner, ")")
 
 	parts := strings.SplitN(inner, ",", 2)
 	if len(parts) != 2 {
-		return AttributeValue{}
+		return AttributeValue{}, false
 	}
 
-	path := strings.TrimSpace(parts[0])
-	defaultPlaceholder := strings.TrimSpace(parts[1])
-
-	if val, ok := item[path]; ok {
-		return val
+	// route66 fork (GH #3669): the guarded operand is a document path, so
+	// if_not_exists(#attrs.#n0, :v) inspects the nested key rather than a
+	// top-level attribute literally named "attributes.attr_a".
+	if path, err := parseDocumentPath(parts[0], exprNames); err == nil {
+		if val, ok := getDocumentPath(pre, path); ok {
+			return val, true
+		}
 	}
 
-	if val, ok := exprValues[defaultPlaceholder]; ok {
-		return val
-	}
+	val, ok := exprValues[strings.TrimSpace(parts[1])]
 
-	return AttributeValue{}
+	return val, ok
 }
 
-// applyIfNotExists handles the if_not_exists(attr, :val) function within a SET clause.
-func applyIfNotExists(item Item, attrName, valueExpr string, exprValues map[string]AttributeValue) {
-	inner := strings.TrimPrefix(valueExpr, "if_not_exists(")
-	inner = strings.TrimSuffix(inner, ")")
-
-	ifParts := strings.SplitN(inner, ",", 2)
-	if len(ifParts) != 2 {
-		return
-	}
-
-	checkAttr := strings.TrimSpace(ifParts[0])
-	if _, exists := item[checkAttr]; exists {
-		return
-	}
-
-	defaultPlaceholder := strings.TrimSpace(ifParts[1])
-
-	if val, ok := exprValues[defaultPlaceholder]; ok {
-		item[attrName] = val
-	}
-}
-
-// applyAddClause handles ADD attr :val.
+// applyAddClause handles ADD path :val.
 // For numbers: atomically increments the value.
 // For sets (SS, NS, BS): adds elements to the set.
-func applyAddClause(item Item, clause string, exprValues map[string]AttributeValue) Item {
-	actions := strings.Split(clause, ",")
-	for _, action := range actions {
+//
+// route66 fork (GH #3669): the target is a document path, so ADD reads the
+// pre-update value from, and writes the merged value back to, the nested
+// location. Number and set semantics are unchanged.
+func applyAddClause(item, pre Item, clause string, exprNames map[string]string, exprValues map[string]AttributeValue) error {
+	for _, action := range strings.Split(clause, ",") {
 		parts := strings.Fields(strings.TrimSpace(action))
 		if len(parts) != 2 {
 			continue
 		}
 
-		attrName := parts[0]
-		valuePlaceholder := parts[1]
-
-		val, ok := exprValues[valuePlaceholder]
+		val, ok := exprValues[parts[1]]
 		if !ok {
 			continue
 		}
 
-		existing, exists := item[attrName]
-		item[attrName] = addAttributeValue(&existing, exists, &val)
+		path, err := parseDocumentPath(parts[0], exprNames)
+		if err != nil {
+			return err
+		}
+
+		existing, exists := getDocumentPath(pre, path)
+
+		if err := setDocumentPath(item, path, addAttributeValue(&existing, exists, &val)); err != nil {
+			return err
+		}
 	}
 
-	return item
+	return nil
 }
 
 // addAttributeValue merges a new value into an existing attribute for the ADD operation.
@@ -1747,61 +1793,82 @@ func addAttributeValue(existing *AttributeValue, exists bool, val *AttributeValu
 	}
 }
 
-// applyDeleteClause handles DELETE attr :val.
+// applyDeleteClause handles DELETE path :val.
 // Removes elements from a set (SS, NS, BS).
-func applyDeleteClause(item Item, clause string, exprValues map[string]AttributeValue) Item {
-	actions := strings.Split(clause, ",")
-	for _, action := range actions {
+//
+// route66 fork (GH #3669): the target is a document path, so a set nested in a
+// map is read and rewritten in place instead of a flat attribute whose name
+// happens to contain dots. Set semantics are unchanged, including removing the
+// attribute outright once the set is emptied (DynamoDB has no empty set type).
+func applyDeleteClause(item, pre Item, clause string, exprNames map[string]string, exprValues map[string]AttributeValue) error {
+	for _, action := range strings.Split(clause, ",") {
 		parts := strings.Fields(strings.TrimSpace(action))
 		if len(parts) != 2 {
 			continue
 		}
 
-		attrName := parts[0]
-		valuePlaceholder := parts[1]
-
-		val, ok := exprValues[valuePlaceholder]
+		val, ok := exprValues[parts[1]]
 		if !ok {
 			continue
 		}
 
-		existing, exists := item[attrName]
+		path, err := parseDocumentPath(parts[0], exprNames)
+		if err != nil {
+			return err
+		}
+
+		existing, exists := getDocumentPath(pre, path)
 		if !exists {
 			continue
 		}
 
+		var updated AttributeValue
+
 		switch {
 		// DELETE from StringSet
 		case len(val.SS) > 0 && len(existing.SS) > 0:
-			remaining := subtractStringSet(existing.SS, val.SS)
-			if len(remaining) == 0 {
-				delete(item, attrName)
-			} else {
-				item[attrName] = AttributeValue{SS: remaining}
-			}
+			updated = AttributeValue{SS: subtractStringSet(existing.SS, val.SS)}
 
 		// DELETE from NumberSet
 		case len(val.NS) > 0 && len(existing.NS) > 0:
-			remaining := subtractStringSet(existing.NS, val.NS)
-			if len(remaining) == 0 {
-				delete(item, attrName)
-			} else {
-				item[attrName] = AttributeValue{NS: remaining}
-			}
+			updated = AttributeValue{NS: subtractStringSet(existing.NS, val.NS)}
+
+		default:
+			continue
+		}
+
+		if len(updated.SS) == 0 && len(updated.NS) == 0 {
+			removeDocumentPath(item, path)
+
+			continue
+		}
+
+		if err := setDocumentPath(item, path, updated); err != nil {
+			return err
 		}
 	}
 
-	return item
+	return nil
 }
 
-// applyRemoveClause handles REMOVE attr1, attr2, ...
-func applyRemoveClause(item Item, clause string) Item {
-	attrs := strings.Split(clause, ",")
-	for _, attr := range attrs {
-		delete(item, strings.TrimSpace(attr))
+// applyRemoveClause handles REMOVE path1, path2, ...
+//
+// route66 fork (GH #3669): "REMOVE #attrs.#n0" deletes the nested map key
+// instead of attempting to delete a top-level attribute named
+// "attributes.attr_a" (which never existed, so the removal was a silent no-op).
+// Removing a path that does not exist stays a no-op; only a malformed or
+// unresolvable path fails the request.
+func applyRemoveClause(item Item, clause string, exprNames map[string]string) error {
+	for _, attr := range strings.Split(clause, ",") {
+		path, err := parseDocumentPath(attr, exprNames)
+		if err != nil {
+			return err
+		}
+
+		removeDocumentPath(item, path)
 	}
 
-	return item
+	return nil
 }
 
 // addNumbers adds two DynamoDB number strings.
@@ -1891,7 +1958,13 @@ func (m *MemoryStorage) TransactWriteItems(_ context.Context, items []TransactWr
 
 	// Phase 2: Apply all mutations atomically.
 	for _, twi := range items {
-		m.applyTransactWriteItem(twi)
+		// route66 fork (GH #3669): applying an update expression can now fail
+		// (invalid document path). Phase 1 already dry-ran every update against
+		// the same state under the same lock, so reaching this is a genuine
+		// anomaly and is surfaced loudly rather than swallowed.
+		if err := m.applyTransactWriteItem(twi); err != nil {
+			return nil, err
+		}
 	}
 
 	m.saveLocked()
@@ -1987,6 +2060,23 @@ func (m *MemoryStorage) validateTransactUpdate(upd *TransactUpdate) (*Cancellati
 		return nil, err
 	}
 
+	// route66 fork (GH #3669): an update expression can fail on an invalid
+	// document path, so it is dry-run here in the validation phase against a
+	// deep copy of the very item phase 2 will mutate (both phases run under the
+	// same lock, so the state cannot move between them). Without this a bad path
+	// would surface halfway through phase 2 with earlier writes already applied,
+	// breaking the all-or-nothing contract.
+	if upd.UpdateExpression != "" {
+		draft := m.copyItem(upd.Key)
+		if existing, ok := td.Items[m.serializeKey(td.Table, upd.Key)]; ok {
+			draft = m.copyItem(existing)
+		}
+
+		if _, err := m.applyUpdateExpression(draft, upd.UpdateExpression, upd.ExpressionAttributeNames, upd.ExpressionAttributeValues); err != nil {
+			return nil, err
+		}
+	}
+
 	return m.checkTransactCondition(upd.TableName, upd.Key, ConditionInput{
 		Expression: upd.ConditionExpression, ExprNames: upd.ExpressionAttributeNames, ExprValues: upd.ExpressionAttributeValues,
 	})
@@ -2036,7 +2126,7 @@ func (m *MemoryStorage) checkTransactCondition(tableName string, keyOrItem Item,
 }
 
 // applyTransactWriteItem applies a single write item mutation. Must be called under lock.
-func (m *MemoryStorage) applyTransactWriteItem(twi TransactWriteItem) {
+func (m *MemoryStorage) applyTransactWriteItem(twi TransactWriteItem) error {
 	switch {
 	case twi.Put != nil:
 		td := m.Tables[twi.Put.TableName]
@@ -2058,12 +2148,19 @@ func (m *MemoryStorage) applyTransactWriteItem(twi TransactWriteItem) {
 		}
 
 		if twi.Update.UpdateExpression != "" {
-			item = m.applyUpdateExpression(item, twi.Update.UpdateExpression, twi.Update.ExpressionAttributeNames, twi.Update.ExpressionAttributeValues)
+			updated, err := m.applyUpdateExpression(item, twi.Update.UpdateExpression, twi.Update.ExpressionAttributeNames, twi.Update.ExpressionAttributeValues)
+			if err != nil {
+				return err
+			}
+
+			item = updated
 		}
 
 		td.Items[key] = item
 	case twi.ConditionCheck != nil:
 	}
+
+	return nil
 }
 
 // TransactGetItems retrieves multiple items transactionally.

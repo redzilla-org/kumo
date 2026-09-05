@@ -593,36 +593,24 @@ func resolveOperand(token string, item Item, values map[string]AttributeValue) A
 	return av
 }
 
-// resolveItemPath resolves a dotted path on an item, returning the value and whether it exists.
+// resolveItemPath resolves a document path on an item, returning the value and
+// whether it exists.
+//
+// route66 fork (GH #3669, local-verify run 140): traversal is delegated to the
+// shared document-path resolver so a condition and an update agree on what a
+// path means, and so list indexes ("a.b[2].c") resolve here too. This evaluator
+// never had the flat-name bug the update path had — it already walked nested
+// maps — so only the traversal moved. Names are substituted into the expression
+// by resolveNames before parsing reaches here, hence the nil alias map; a path
+// that does not parse simply does not exist, which is how an unknown attribute
+// has always been treated in a condition.
 func resolveItemPath(item Item, path string) (AttributeValue, bool) {
-	parts := strings.Split(path, ".")
-
-	if len(parts) == 1 {
-		val, ok := item[path]
-
-		return val, ok
-	}
-
-	// Nested path traversal.
-	val, ok := item[parts[0]]
-	if !ok {
+	elements, err := parseDocumentPath(path, nil)
+	if err != nil {
 		return AttributeValue{}, false
 	}
 
-	for _, part := range parts[1:] {
-		if val.M == nil {
-			return AttributeValue{}, false
-		}
-
-		ptr, ok := val.M[part]
-		if !ok || ptr == nil {
-			return AttributeValue{}, false
-		}
-
-		val = *ptr
-	}
-
-	return val, true
+	return getDocumentPath(item, elements)
 }
 
 // compareAttributeValues compares two attribute values using the given operator.
