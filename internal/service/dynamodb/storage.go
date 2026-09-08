@@ -484,12 +484,32 @@ func (m *MemoryStorage) PutItem(_ context.Context, tableName string, item Item, 
 	return oldItem, nil
 }
 
+// tableByIdentifier accepts the table name or full ARN supported by DynamoDB
+// read APIs. Comparing the stored ARN prevents a name match from redirecting a
+// request for another account, region, or resource. The caller holds m.mu.
+func (m *MemoryStorage) tableByIdentifier(identifier string) (*tableData, bool) {
+	if !strings.HasPrefix(identifier, "arn:") {
+		td, exists := m.Tables[identifier]
+		return td, exists
+	}
+	_, name, valid := strings.Cut(identifier, ":table/")
+	if !valid {
+		return nil, false
+	}
+	td, exists := m.Tables[name]
+	if !exists || td.Table.TableARN != identifier {
+		return nil, false
+	}
+	return td, true
+}
+
 // GetItem gets an item from a table.
 func (m *MemoryStorage) GetItem(_ context.Context, tableName string, key Item) (Item, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	td, exists := m.Tables[tableName]
+	// TableName also accepts the exact table ARN used by cross-account readers.
+	td, exists := m.tableByIdentifier(tableName)
 	if !exists {
 		return nil, &TableError{
 			Code:    "ResourceNotFoundException",
@@ -693,7 +713,8 @@ func (m *MemoryStorage) Query(_ context.Context, tableName, indexName, keyCondEx
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	td, exists := m.Tables[tableName]
+	// Keep ARN addressing equivalent to GetItem without discarding its identity.
+	td, exists := m.tableByIdentifier(tableName)
 	if !exists {
 		return nil, nil, 0, &TableError{
 			Code:    "ResourceNotFoundException",
