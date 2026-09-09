@@ -281,7 +281,7 @@ func materializeStack(ctx context.Context, req *CreateStackRequest, stack *Stack
 		rtype, _ := rm["Type"].(string)
 
 		switch {
-		case rtype == "AWS::DynamoDB::Table", rtype == "AWS::S3::Bucket", rtype == "AWS::SSM::Parameter":
+		case rtype == "AWS::DynamoDB::Table", rtype == "AWS::S3::Bucket", rtype == "AWS::S3::BucketPolicy", rtype == "AWS::SSM::Parameter":
 		case inertTypes[rtype]:
 		default:
 			return fmt.Errorf("resource %s has type %q which this emulator cannot materialize; refusing to silently skip it", logicalID, rtype)
@@ -413,6 +413,8 @@ func materializeOne(ctx context.Context, b *backends, ec *evalCtx, logicalID str
 		sr.PhysicalResourceID, err = createTable(ctx, b.ddb, pm)
 	case "AWS::S3::Bucket":
 		sr.PhysicalResourceID, err = createBucket(ctx, b.s3, pm, stack.StackName, logicalID)
+	case "AWS::S3::BucketPolicy":
+		sr.PhysicalResourceID, err = createBucketPolicy(ctx, b.s3, pm)
 	case "AWS::SSM::Parameter":
 		sr.PhysicalResourceID, err = createParameter(ctx, b.ssm, pm)
 	default:
@@ -462,6 +464,25 @@ func createTable(ctx context.Context, ddb dynamodb.Storage, props map[string]any
 	}
 
 	return req.TableName, nil
+}
+
+// createBucketPolicy persists the evaluated policy through the same S3 backend
+// as Put/GetBucketPolicy. A Ref to its bucket orders creation correctly; this
+// is real stored policy state, not a claim that the emulator evaluates IAM.
+func createBucketPolicy(ctx context.Context, st s3.Storage, props map[string]any) (string, error) {
+	bucket, _ := props["Bucket"].(string)
+	document, ok := props["PolicyDocument"].(map[string]any)
+	if strings.TrimSpace(bucket) == "" || !ok || len(document) == 0 {
+		return "", fmt.Errorf("Bucket and object PolicyDocument are required")
+	}
+	raw, err := json.Marshal(document)
+	if err != nil {
+		return "", fmt.Errorf("marshal bucket policy: %w", err)
+	}
+	if err := st.PutBucketPolicy(ctx, bucket, string(raw)); err != nil {
+		return "", fmt.Errorf("PutBucketPolicy: %w", err)
+	}
+	return bucket, nil
 }
 
 func createBucket(ctx context.Context, st s3.Storage, props map[string]any, stackName, logicalID string) (string, error) {
@@ -548,6 +569,10 @@ func teardownOne(ctx context.Context, b *backends, sr StackResource) error {
 		return err
 	case "AWS::S3::Bucket":
 		return b.s3.DeleteBucket(ctx, sr.PhysicalResourceID)
+	case "AWS::S3::BucketPolicy":
+		// Reverse dependency teardown removes the policy before its bucket,
+		// including rollback after a later resource fails to materialize.
+		return b.s3.DeleteBucketPolicy(ctx, sr.PhysicalResourceID)
 	case "AWS::SSM::Parameter":
 		return b.ssm.DeleteParameter(ctx, sr.PhysicalResourceID)
 	}
