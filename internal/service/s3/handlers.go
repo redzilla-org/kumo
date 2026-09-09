@@ -877,10 +877,19 @@ func (s *Service) getCopySource(ctx context.Context, bucket, key, versionID stri
 	return obj, nil
 }
 
+// Native object headers are persisted beside user metadata so Put, Copy and
+// multipart upload retain the same serving contract. Canonical header names
+// distinguish them from lower-case x-amz-meta-* keys with similar names.
+var storedObjectHeaders = [...]string{
+	contentTypeHeader, "Cache-Control", "Content-Disposition", "Content-Encoding", "Content-Language", "Expires",
+}
+
 func extractObjectMetadata(header http.Header) map[string]string {
 	metadata := make(map[string]string)
-	if ct := header.Get(contentTypeHeader); ct != "" {
-		metadata[contentTypeHeader] = ct
+	for _, name := range storedObjectHeaders {
+		if value := header.Get(name); value != "" {
+			metadata[name] = value
+		}
 	}
 
 	for name, values := range header {
@@ -902,6 +911,25 @@ func extractObjectMetadata(header http.Header) map[string]string {
 	}
 
 	return metadata
+}
+
+// GET, ranged GET and HEAD expose native headers as native headers, never as
+// invented user metadata. Explicit response-* query overrides already on the
+// writer retain precedence over the object's stored values.
+func writeStoredObjectMetadata(w http.ResponseWriter, metadata map[string]string) {
+	for key, value := range metadata {
+		native := false
+		for _, name := range storedObjectHeaders {
+			if key == name {
+				setIfAbsent(w, name, value)
+				native = true
+				break
+			}
+		}
+		if !native {
+			w.Header().Set("x-amz-meta-"+key, value)
+		}
+	}
 }
 
 func copyObjectMetadata(header http.Header, src map[string]string) (map[string]string, error) {
@@ -1100,11 +1128,7 @@ func writePartialObjectResponse(w http.ResponseWriter, obj *Object, start, end i
 		w.Header().Set("x-amz-version-id", obj.VersionID)
 	}
 
-	for k, v := range obj.Metadata {
-		if k != contentTypeHeader {
-			w.Header().Set("x-amz-meta-"+k, v)
-		}
-	}
+	writeStoredObjectMetadata(w, obj.Metadata)
 
 	w.WriteHeader(http.StatusPartialContent)
 	_, _ = w.Write(obj.Body[start : end+1])
@@ -1226,11 +1250,7 @@ func writeObjectResponse(w http.ResponseWriter, obj *Object) {
 		w.Header().Set("x-amz-version-id", obj.VersionID)
 	}
 
-	for k, v := range obj.Metadata {
-		if k != contentTypeHeader {
-			w.Header().Set("x-amz-meta-"+k, v)
-		}
-	}
+	writeStoredObjectMetadata(w, obj.Metadata)
 
 	if obj.ServerSideEncryption != "" {
 		w.Header().Set("x-amz-server-side-encryption", obj.ServerSideEncryption)
@@ -1415,11 +1435,7 @@ func (s *Service) HeadObject(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Last-Modified", obj.LastModified.UTC().Format(timeFormatHTTP))
 	w.Header().Set("Accept-Ranges", "bytes")
 
-	for k, v := range obj.Metadata {
-		if k != contentTypeHeader {
-			w.Header().Set("x-amz-meta-"+k, v)
-		}
-	}
+	writeStoredObjectMetadata(w, obj.Metadata)
 
 	if obj.ServerSideEncryption != "" {
 		w.Header().Set("x-amz-server-side-encryption", obj.ServerSideEncryption)
