@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +22,7 @@ type Storage interface {
 	GetIdentityVerificationAttributes(ctx context.Context, identities []string) (map[string]string, error)
 	SendEmail(ctx context.Context, email *SentEmail) (string, error)
 	GetMailbox(ctx context.Context, email string) ([]*SentEmail, error)
+	WaitForEmailContaining(ctx context.Context, contains string) ([]*SentEmail, error)
 }
 
 // Option is a configuration option for MemoryStorage.
@@ -45,6 +47,7 @@ type MemoryStorage struct {
 	Identities map[string]*Identity `json:"identities"`
 	Emails     []*SentEmail         `json:"emails"`
 	dataDir    string
+	notify     chan struct{} `json:"-"`
 }
 
 // NewMemoryStorage creates a new in-memory SES storage.
@@ -52,6 +55,7 @@ func NewMemoryStorage(opts ...Option) *MemoryStorage {
 	s := &MemoryStorage{
 		Identities: make(map[string]*Identity),
 		Emails:     make([]*SentEmail, 0),
+		notify:     make(chan struct{}),
 	}
 	for _, o := range opts {
 		o(s)
@@ -98,6 +102,9 @@ func (m *MemoryStorage) UnmarshalJSON(data []byte) error {
 
 	if m.Emails == nil {
 		m.Emails = make([]*SentEmail, 0)
+	}
+	if m.notify == nil {
+		m.notify = make(chan struct{})
 	}
 
 	return nil
@@ -191,10 +198,46 @@ func (m *MemoryStorage) SendEmail(_ context.Context, email *SentEmail) (string, 
 	email.MessageID = uuid.New().String()
 	email.SentAt = time.Now()
 	m.Emails = append(m.Emails, email)
+	// Wake mailbox long polls only after the message is visible under the same
+	// lock. Replacing the channel gives every subsequent waiter a fresh edge.
+	close(m.notify)
+	m.notify = make(chan struct{})
 
 	m.saveLocked()
 
 	return email.MessageID, nil
+}
+
+// WaitForEmailContaining blocks until a stored envelope or body contains the
+// caller's correlation token. SES capture is an event stream in local tests;
+// exposing its notification edge avoids repeated HTTP scans and returns as soon
+// as the Lambda writes the matching message.
+func (m *MemoryStorage) WaitForEmailContaining(ctx context.Context, contains string) ([]*SentEmail, error) {
+	for {
+		m.mu.RLock()
+		var result []*SentEmail
+		for _, email := range m.Emails {
+			fields := []string{email.Source, email.Subject, email.Body, email.HTMLBody}
+			fields = append(fields, email.Destination...)
+			for _, field := range fields {
+				if strings.Contains(field, contains) {
+					result = append(result, email)
+					break
+				}
+			}
+		}
+		notify := m.notify
+		m.mu.RUnlock()
+		if len(result) > 0 {
+			return result, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, nil
+		case <-notify:
+		}
+	}
 }
 
 // GetMailbox returns all sent emails for the given sender email address.
