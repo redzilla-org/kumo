@@ -2,7 +2,10 @@
 package cloudformation
 
 import (
+	"bytes"
+	"encoding/json"
 	"encoding/xml"
+	"fmt"
 	"time"
 )
 
@@ -77,12 +80,85 @@ type TemplateParameter struct {
 
 // Request types.
 
+// StackParameters keeps CloudFormation's internal parameter lookup cheap while
+// accepting the array shape emitted by the AWS Query protocol dispatcher.
+type StackParameters map[string]string
+
+// UnmarshalJSON normalizes supported wire representations into the map used by
+// template materialization. The legacy object form remains valid because direct
+// JSON callers already send it, while malformed Query entries fail before a
+// partially populated stack can be created.
+func (p *StackParameters) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if bytes.Equal(data, []byte("null")) {
+		*p = nil
+
+		return nil
+	}
+
+	if len(data) == 0 {
+		return fmt.Errorf("CloudFormation parameters must be a JSON object or array")
+	}
+
+	if data[0] == '{' {
+		var parameters map[string]string
+		if err := json.Unmarshal(data, &parameters); err != nil {
+			return fmt.Errorf("invalid CloudFormation parameter map: %w", err)
+		}
+
+		for key := range parameters {
+			if key == "" {
+				return fmt.Errorf("CloudFormation parameter key must not be empty")
+			}
+		}
+
+		*p = parameters
+
+		return nil
+	}
+
+	if data[0] != '[' {
+		return fmt.Errorf("CloudFormation parameters must be a JSON object or array")
+	}
+
+	// Pointers distinguish a missing field from an explicitly supplied empty
+	// value, which CloudFormation parameters are allowed to carry.
+	var entries []struct {
+		ParameterKey   *string `json:"ParameterKey"`
+		ParameterValue *string `json:"ParameterValue"`
+	}
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return fmt.Errorf("invalid CloudFormation parameter list: %w", err)
+	}
+
+	parameters := make(map[string]string, len(entries))
+	for i, entry := range entries {
+		if entry.ParameterKey == nil || *entry.ParameterKey == "" {
+			return fmt.Errorf("CloudFormation parameter entry %d has no ParameterKey", i)
+		}
+
+		if entry.ParameterValue == nil {
+			return fmt.Errorf("CloudFormation parameter entry %d has no ParameterValue", i)
+		}
+
+		if _, exists := parameters[*entry.ParameterKey]; exists {
+			return fmt.Errorf("CloudFormation parameter entry %d duplicates ParameterKey %q", i, *entry.ParameterKey)
+		}
+
+		parameters[*entry.ParameterKey] = *entry.ParameterValue
+	}
+
+	*p = parameters
+
+	return nil
+}
+
 // CreateStackRequest represents a CreateStack request.
 type CreateStackRequest struct {
-	StackName    string            `json:"StackName"`
-	TemplateBody string            `json:"TemplateBody,omitempty"`
-	TemplateURL  string            `json:"TemplateURL,omitempty"`
-	Parameters   map[string]string `json:"Parameters,omitempty"`
+	StackName    string          `json:"StackName"`
+	TemplateBody string          `json:"TemplateBody,omitempty"`
+	TemplateURL  string          `json:"TemplateURL,omitempty"`
+	Parameters   StackParameters `json:"Parameters,omitempty"`
 }
 
 // DeleteStackRequest represents a DeleteStack request.
@@ -102,9 +178,9 @@ type ListStacksRequest struct {
 
 // UpdateStackRequest represents an UpdateStack request.
 type UpdateStackRequest struct {
-	StackName    string            `json:"StackName"`
-	TemplateBody string            `json:"TemplateBody,omitempty"`
-	Parameters   map[string]string `json:"Parameters,omitempty"`
+	StackName    string          `json:"StackName"`
+	TemplateBody string          `json:"TemplateBody,omitempty"`
+	Parameters   StackParameters `json:"Parameters,omitempty"`
 }
 
 // DescribeStackResourcesRequest represents a DescribeStackResources request.
