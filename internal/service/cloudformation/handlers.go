@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -23,7 +26,9 @@ const (
 func (s *Service) CreateStack(w http.ResponseWriter, r *http.Request) {
 	var req CreateStackRequest
 	if err := readCFNJSONRequest(r, &req); err != nil {
-		writeCFNError(w, errInvalidParameter, "Failed to parse request body", http.StatusBadRequest)
+		// route66 #3923: the cause is appended because a bare "Failed to parse
+		// request body" hid which field the decoder rejected.
+		writeCFNError(w, errInvalidParameter, "Failed to parse request body: "+err.Error(), http.StatusBadRequest)
 
 		return
 	}
@@ -421,11 +426,92 @@ func readCFNJSONRequest(r *http.Request, v any) error {
 		return nil
 	}
 
+	// route66 #3923: the AWS Query dispatcher already parsed the original form
+	// into r.Form and then coerced every scalar through parseFormValue, so a
+	// ParameterValue of "false" or "42" reaches this decoder as a JSON bool or
+	// number and the string-typed field rejects the whole request. Parameter
+	// values are strings by the CloudFormation API contract, so they are rebuilt
+	// from the untouched form strings rather than re-stringified from the
+	// coerced JSON, which would lose spellings such as "007" or "True".
+	body, err = restoreQueryStackParameters(r.Form, body)
+	if err != nil {
+		return err
+	}
+
 	if err := json.Unmarshal(body, v); err != nil {
 		return fmt.Errorf("failed to unmarshal JSON: %w", err)
 	}
 
 	return nil
+}
+
+// queryParametersPrefix is the AWS Query spelling of CreateStack/UpdateStack
+// Parameters list members: Parameters.member.<N>.<Field>.
+const queryParametersPrefix = "Parameters.member."
+
+// restoreQueryStackParameters replaces the dispatcher-coerced "Parameters"
+// array in body with one rebuilt from the raw form strings. A request carrying
+// no Parameters.member.* form keys (direct JSON callers, or a Query call with
+// no parameters) is returned unchanged. Only fields actually present in the
+// form are emitted, so StackParameters' missing-key/missing-value validation
+// still fires on malformed input.
+func restoreQueryStackParameters(form url.Values, body []byte) ([]byte, error) {
+	members := map[int]map[string]string{}
+
+	for key, values := range form {
+		rest, ok := strings.CutPrefix(key, queryParametersPrefix)
+		if !ok || len(values) != 1 {
+			continue
+		}
+
+		idxText, field, ok := strings.Cut(rest, ".")
+		if !ok || strings.Contains(field, ".") {
+			return nil, fmt.Errorf("unsupported CloudFormation query parameter key %q", key)
+		}
+
+		idx, err := strconv.Atoi(idxText)
+		if err != nil {
+			return nil, fmt.Errorf("non-numeric member index in CloudFormation query parameter key %q", key)
+		}
+
+		if members[idx] == nil {
+			members[idx] = map[string]string{}
+		}
+
+		members[idx][field] = values[0]
+	}
+
+	if len(members) == 0 {
+		return body, nil
+	}
+
+	// Member order is the Query list order; StackParameters reports entries by
+	// position, so the rebuilt array keeps the caller's indices sorted.
+	indices := make([]int, 0, len(members))
+	for idx := range members {
+		indices = append(indices, idx)
+	}
+
+	sort.Ints(indices)
+
+	entries := make([]map[string]string, 0, len(indices))
+	for _, idx := range indices {
+		entries = append(entries, members[idx])
+	}
+
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal JSON: %w", err)
+	}
+
+	raw, err := json.Marshal(entries)
+	if err != nil {
+		return nil, fmt.Errorf("marshal CloudFormation query parameters: %w", err)
+	}
+
+	doc["Parameters"] = raw
+
+	return json.Marshal(doc)
 }
 
 // extractAction extracts the action name from the request.

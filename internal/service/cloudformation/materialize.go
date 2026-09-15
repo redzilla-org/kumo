@@ -56,6 +56,118 @@ type evalCtx struct {
 	// physical: logicalID -> physical resource name, filled as resources
 	// materialize, so Ref-to-resource resolves to the real name.
 	physical map[string]string
+	// conditionDefs: the template's raw Conditions section (route66 #3923).
+	// Evaluated lazily by condition name and memoized in conditions, because a
+	// condition may reference another through {"Condition": name}.
+	conditionDefs map[string]any
+	conditions    map[string]bool
+}
+
+// noValue is what {"Ref": "AWS::NoValue"} evaluates to inside a property tree
+// (route66 #3923). Real CloudFormation removes the enclosing property or list
+// element; returning "" instead would hand, e.g., a DynamoDB table a string
+// where a Tags list belongs.
+type noValue struct{}
+
+// condition resolves one named template condition to its boolean value.
+func (c *evalCtx) condition(name string) (bool, error) {
+	if v, ok := c.conditions[name]; ok {
+		return v, nil
+	}
+
+	def, ok := c.conditionDefs[name]
+	if !ok {
+		return false, fmt.Errorf("unknown condition %q", name)
+	}
+
+	// Memoize so a condition referenced by many resources evaluates once.
+	if c.conditions == nil {
+		c.conditions = map[string]bool{}
+	}
+
+	v, err := c.evalCondition(def)
+	if err != nil {
+		return false, fmt.Errorf("condition %s: %w", name, err)
+	}
+
+	c.conditions[name] = v
+
+	return v, nil
+}
+
+// evalCondition evaluates the condition functions CloudFormation allows in a
+// Conditions section: Fn::Equals, Fn::Not, Fn::And, Fn::Or and a nested
+// {"Condition": name}. Anything else fails loudly.
+func (c *evalCtx) evalCondition(v any) (bool, error) {
+	m, ok := v.(map[string]any)
+	if !ok || len(m) != 1 {
+		return false, fmt.Errorf("condition must be a single-key intrinsic, got %v", v)
+	}
+
+	for fn, arg := range m {
+		if fn == "Condition" {
+			name, ok := arg.(string)
+			if !ok {
+				return false, fmt.Errorf("non-string Condition reference %v", arg)
+			}
+
+			return c.condition(name)
+		}
+
+		args, ok := arg.([]any)
+		if !ok {
+			return false, fmt.Errorf("%s needs a list argument, got %T", fn, arg)
+		}
+
+		switch fn {
+		case "Fn::Equals":
+			if len(args) != 2 {
+				return false, fmt.Errorf("Fn::Equals needs 2 arguments, got %d", len(args))
+			}
+
+			left, err := c.eval(args[0])
+			if err != nil {
+				return false, err
+			}
+
+			right, err := c.eval(args[1])
+			if err != nil {
+				return false, err
+			}
+
+			return fmt.Sprint(left) == fmt.Sprint(right), nil
+		case "Fn::Not":
+			if len(args) != 1 {
+				return false, fmt.Errorf("Fn::Not needs 1 argument, got %d", len(args))
+			}
+
+			inner, err := c.evalCondition(args[0])
+
+			return !inner, err
+		case "Fn::And", "Fn::Or":
+			isAnd := fn == "Fn::And"
+			result := isAnd
+
+			for _, a := range args {
+				inner, err := c.evalCondition(a)
+				if err != nil {
+					return false, err
+				}
+
+				if isAnd {
+					result = result && inner
+				} else {
+					result = result || inner
+				}
+			}
+
+			return result, nil
+		default:
+			return false, fmt.Errorf("unsupported condition function %s", fn)
+		}
+	}
+
+	return false, fmt.Errorf("unreachable empty condition")
 }
 
 func (c *evalCtx) pseudo(name string) (string, bool) {
@@ -130,8 +242,9 @@ func (c *evalCtx) evalSub(tmpl string) (string, error) {
 	}
 }
 
-// eval recursively evaluates a property tree, resolving Ref and Fn::Sub
-// (string form). Any other intrinsic (Fn::GetAtt, Fn::If, ...) is a hard
+// eval recursively evaluates a property tree, resolving Ref, Fn::Sub
+// (string form), Fn::If and AWS::NoValue (route66 #3923). Any other
+// intrinsic (Fn::GetAtt, Fn::Join, ...) is a hard
 // error: the caller only evaluates properties of resources we materialize,
 // and those must be fully resolvable.
 func (c *evalCtx) eval(v any) (any, error) {
@@ -144,7 +257,37 @@ func (c *evalCtx) eval(v any) (any, error) {
 					return nil, fmt.Errorf("non-string Ref %v", ref)
 				}
 
+				// route66 #3923: the enclosing map/list drops this value.
+				if name == "AWS::NoValue" {
+					return noValue{}, nil
+				}
+
 				return c.resolveRef(name)
+			}
+
+			// route66 #3923: Fn::If [condition, whenTrue, whenFalse] evaluates
+			// only the selected branch, as CloudFormation does.
+			if ifArg, ok := t["Fn::If"]; ok {
+				args, ok := ifArg.([]any)
+				if !ok || len(args) != 3 {
+					return nil, fmt.Errorf("Fn::If needs [condition, whenTrue, whenFalse], got %v", ifArg)
+				}
+
+				name, ok := args[0].(string)
+				if !ok {
+					return nil, fmt.Errorf("Fn::If condition name must be a string, got %T", args[0])
+				}
+
+				cond, err := c.condition(name)
+				if err != nil {
+					return nil, fmt.Errorf("Fn::If: %w", err)
+				}
+
+				if cond {
+					return c.eval(args[1])
+				}
+
+				return c.eval(args[2])
 			}
 
 			if sub, ok := t["Fn::Sub"]; ok {
@@ -171,20 +314,30 @@ func (c *evalCtx) eval(v any) (any, error) {
 				return nil, fmt.Errorf("%s: %w", k, err)
 			}
 
+			// AWS::NoValue removes the property entirely.
+			if _, drop := ev.(noValue); drop {
+				continue
+			}
+
 			out[k] = ev
 		}
 
 		return out, nil
 	case []any:
-		out := make([]any, len(t))
+		out := make([]any, 0, len(t))
 
-		for i, val := range t {
+		for _, val := range t {
 			ev, err := c.eval(val)
 			if err != nil {
 				return nil, err
 			}
 
-			out[i] = ev
+			// AWS::NoValue removes the list element entirely.
+			if _, drop := ev.(noValue); drop {
+				continue
+			}
+
+			out = append(out, ev)
 		}
 
 		return out, nil
@@ -254,6 +407,9 @@ func materializeStack(ctx context.Context, req *CreateStackRequest, stack *Stack
 		physical:  map[string]string{},
 	}
 
+	// route66 #3923: Conditions feed Fn::If and resource-level Condition keys.
+	ec.conditionDefs, _ = template["Conditions"].(map[string]any)
+
 	// Parameter values: template defaults overlaid by request parameters.
 	if pdefs, ok := template["Parameters"].(map[string]any); ok {
 		for name, def := range pdefs {
@@ -305,6 +461,24 @@ func materializeStack(ctx context.Context, req *CreateStackRequest, stack *Stack
 			rm, _ := raw.(map[string]any)
 			if !depsSatisfied(rm, resources, done) {
 				continue
+			}
+
+			// route66 #3923: a resource whose Condition is false is not
+			// created, exactly as CloudFormation skips it.
+			if condName, ok := rm["Condition"].(string); ok {
+				create, err := ec.condition(condName)
+				if err != nil {
+					rollbackMaterialized(ctx, b, newResources)
+
+					return fmt.Errorf("resource %s: %w", logicalID, err)
+				}
+
+				if !create {
+					done[logicalID] = true
+					progressed = true
+
+					continue
+				}
 			}
 
 			sr, err := materializeOne(ctx, b, ec, logicalID, rm, stack)
